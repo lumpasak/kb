@@ -1,0 +1,194 @@
+# create_users.yml - Ansible playbook for Linux user provisioning
+#
+# Usage:
+#   ansible-playbook create_users.yml -i inventory.ini
+#   ansible-playbook create_users.yml -i inventory.ini --tags create
+#   ansible-playbook create_users.yml -i inventory.ini --tags remove
+#   ansible-playbook create_users.yml -i inventory.ini -e "target_hosts=webservers"
+#
+# Variables can be overridden via:
+#   - group_vars / host_vars
+#   - extra vars (-e)
+#   - vars file (--extra-vars @users.yml)
+ 
+- name: Linux User Provisioning
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: true
+ 
+  vars:
+    # Default values — override in group_vars, host_vars, or extra-vars
+    default_shell: /bin/bash
+    default_create_home: true
+    default_password_expire: false
+    default_generate_ssh_key: false
+    ssh_key_bits: 4096
+    skeleton_dir: /etc/skel
+ 
+    # ---------------------------------------------------------------
+    # Define users here or load from an external vars file
+    # ---------------------------------------------------------------
+    users_present:
+      - username: jdoe
+        comment: "John Doe"
+        shell: /bin/bash
+        groups:
+          - sudo
+          - docker
+        # Password hash — generate with:
+        #   ansible all -i localhost, -m debug -a "msg={{ 'MyPassword' | password_hash('sha512') }}"
+        #   python3 -c "from passlib.hash import sha512_crypt; print(sha512_crypt.hash('MyPassword'))"
+        password: "{{ vault_jdoe_password | default(omit) }}"
+        password_expire: true
+        generate_ssh_key: true
+        ssh_authorized_keys:
+          - "ssh-ed25519 AAAA... jdoe@workstation"
+        uid: 2001
+ 
+      - username: asmith
+        comment: "Alice Smith"
+        groups:
+          - developers
+        uid: 2002
+ 
+    users_absent:
+      - username: old_user
+        remove_home: true
+ 
+    # Groups to ensure exist before user creation
+    required_groups:
+      - developers
+      - docker
+ 
+  tasks:
+    # ==============================================================
+    # PRE-CHECKS
+    # ==============================================================
+    - name: Display target hosts
+      ansible.builtin.debug:
+        msg: "Provisioning users on {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+      tags: [always]
+ 
+    # ==============================================================
+    # GROUP MANAGEMENT
+    # ==============================================================
+    - name: Ensure required groups exist
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ required_groups }}"
+      tags: [create, groups]
+ 
+    # ==============================================================
+    # USER CREATION
+    # ==============================================================
+    - name: Create users
+      ansible.builtin.user:
+        name: "{{ item.username }}"
+        comment: "{{ item.comment | default(omit) }}"
+        uid: "{{ item.uid | default(omit) }}"
+        shell: "{{ item.shell | default(default_shell) }}"
+        groups: "{{ item.groups | default(omit) }}"
+        append: true
+        create_home: "{{ item.create_home | default(default_create_home) }}"
+        skeleton: "{{ skeleton_dir }}"
+        password: "{{ item.password | default(omit) }}"
+        update_password: on_create
+        generate_ssh_key: "{{ item.generate_ssh_key | default(default_generate_ssh_key) }}"
+        ssh_key_bits: "{{ ssh_key_bits }}"
+        state: present
+      loop: "{{ users_present }}"
+      loop_control:
+        label: "{{ item.username }}"
+      register: user_results
+      tags: [create]
+ 
+    - name: Force password change on first login
+      ansible.builtin.command:
+        cmd: "chage -d 0 {{ item.item.username }}"
+      loop: "{{ user_results.results }}"
+      loop_control:
+        label: "{{ item.item.username }}"
+      when:
+        - item.changed
+        - item.item.password_expire | default(default_password_expire)
+      changed_when: true
+      tags: [create]
+ 
+    # ==============================================================
+    # SSH KEY MANAGEMENT
+    # ==============================================================
+    - name: Ensure .ssh directory exists
+      ansible.builtin.file:
+        path: "/home/{{ item.username }}/.ssh"
+        state: directory
+        owner: "{{ item.username }}"
+        group: "{{ item.username }}"
+        mode: "0700"
+      loop: "{{ users_present }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: item.ssh_authorized_keys is defined
+      tags: [create, ssh]
+ 
+    - name: Deploy authorized SSH keys
+      ansible.posix.authorized_key:
+        user: "{{ item.0.username }}"
+        key: "{{ item.1 }}"
+        state: present
+        exclusive: false
+      loop: "{{ users_present | subelements('ssh_authorized_keys', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.username }}"
+      tags: [create, ssh]
+ 
+    # ==============================================================
+    # SUDO CONFIGURATION (optional per-user sudoers)
+    # ==============================================================
+    - name: Configure sudoers for users with sudo group
+      ansible.builtin.template:
+        src: sudoers_user.j2
+        dest: "/etc/sudoers.d/{{ item.username }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+      loop: "{{ users_present }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: "'sudo' in (item.groups | default([]))"
+      tags: [create, sudo]
+ 
+    # ==============================================================
+    # USER REMOVAL
+    # ==============================================================
+    - name: Remove users
+      ansible.builtin.user:
+        name: "{{ item.username }}"
+        state: absent
+        remove: "{{ item.remove_home | default(false) }}"
+        force: true
+      loop: "{{ users_absent }}"
+      loop_control:
+        label: "{{ item.username }}"
+      tags: [remove]
+ 
+    - name: Remove sudoers files for removed users
+      ansible.builtin.file:
+        path: "/etc/sudoers.d/{{ item.username }}"
+        state: absent
+      loop: "{{ users_absent }}"
+      loop_control:
+        label: "{{ item.username }}"
+      tags: [remove]
+ 
+    # ==============================================================
+    # SUMMARY
+    # ==============================================================
+    - name: User provisioning summary
+      ansible.builtin.debug:
+        msg: |
+          === User Provisioning Complete ===
+          Created/Updated: {{ users_present | map(attribute='username') | list | join(', ') }}
+          Removed: {{ users_absent | map(attribute='username') | list | join(', ') }}
+      tags: [always]
