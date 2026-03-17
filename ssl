@@ -1,0 +1,423 @@
+1. Prerequisites
+2. Zdrojove repository
+3. Podepsani certifikatu
+3.1. Kontrola CSR souboru
+3.1.1. Prikaz pro kontrolu CSR
+3.1.2. Master + Edge
+3.1.3. Worker
+3.1.4. Nginx
+4. Enable AutoTLS
+4.1. Zalozeni uzivatele v clusteru
+4.2. Priprava slozek na CM serveru a nahrani certifikatu s klicema
+4.3. Zapnuti AutoTLS
+4.4. Restart cloudera-scm-server
+4.5. Restart cloudera-scm-agent
+4.6. Restart cluster
+4.7. Smazani uzivatele z clusteru a odstraneni sudo prav
+5. Validace
+5.1. Kontrola cloudera-scm-agent konfigurace
+5.2. Troubleshooting
+6. Nahrazeni certifikatu
+7. Adhoc prikazy
+1. Prerequisites
+Uzivatel se sudo pravy
+Ansible
+Podepsane certifikaty
+
+
+2. Zdrojove repository
+Vsechny kody k AutoTLS jsou ulozene zde - https://git.kb.cz/projects/COTOOL/repos/ansible/browse
+
+3. Podepsani certifikatu
+(minus) PRI ZAKLADANI SMAX POZADAVKU NA PODPIS JE VZDY TREBA VYPLNIT DO POPISU, ZE POTREBUJEME I ROZSIRENI CLIENTAUTH, ACKOLIV JE V CSR. DEFAULTNE SE PODEPISUJE BEZ TOHOTO ROZSIRENI!!!!
+
+Vygenerovani zadosti o podpis (CSR) spustime nasledujicim prikazem:
+
+get csr
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# 
+Generate CSR files for CDPD enviornment
+ansible-playbook playbooks/generate_csr.yaml -i inventory/cdpd -e "target_env=cdpd"
+V pripade, ze chceme spustit generovani certifikatu pouze pro servery v clusteru, spustime prikaz nasledovne: 
+
+get csr
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# 
+Generate CSR files for CDPD enviornment
+ansible-playbook playbooks/generate_csr.yaml -i inventory/cdpd -e "target_env=cdpd" -l cloudera
+(warning) Ansible skript predpoklada, ze inventory file obsahuje skupiny edge, worker a master (nikoliv cdpd_master), aby bylo mozne spustit generovani i pro cdpp
+
+Hodnota promenne target_env - cdpd nebo cdpp. Pro ostatni prostredi neni skript nastaveny
+
+Inventory file by mel vypadat nasledovne (konkretni servery se mohou lisit):
+
+Inventory
+
+
+[edge]
+cn75x006.sos.kb.cz      hostname=cn75x006.sos.kb.cz     short=cn75x006  ip=10.6.141.150
+
+[master]
+cn75x007.sos.kb.cz      hostname=cn75x007.sos.kb.cz     short=cn75x007  ip=10.6.141.149
+cn64x061.sos.kb.cz      hostname=cn64x061.sos.kb.cz     short=cn64x061  ip=10.6.141.45
+
+[worker]
+cn75x001.sos.kb.cz      hostname=cn75x001.sos.kb.cz     short=cn75x001  ip=10.6.141.144
+cn75x002.sos.kb.cz      hostname=cn75x002.sos.kb.cz     short=cn75x002  ip=10.6.141.145
+cn75x003.sos.kb.cz      hostname=cn75x003.sos.kb.cz     short=cn75x003  ip=10.6.141.146
+cn75x004.sos.kb.cz      hostname=cn75x004.sos.kb.cz     short=cn75x004  ip=10.6.141.147
+cn75x005.sos.kb.cz      hostname=cn75x005.sos.kb.cz     short=cn75x005  ip=10.6.141.148
+cn74x016.sos.kb.cz      hostname=cn74x016.sos.kb.cz     short=cn74x016  ip=10.6.141.130
+cn74x017.sos.kb.cz      hostname=cn74x017.sos.kb.cz     short=cn74x017  ip=10.6.141.131
+
+[nginx]
+vcnbb0019.sos.kb.cz hostname=vcnbb0019.sos.kb.cz short=vcnbb0019 ip=10.6.203.19
+vcvbb0020.sos.kb.cz hostname=vcvbb0020.sos.kb.cz short=vcvbb0020 ip=10.6.203.20
+3.1. Kontrola CSR souboru
+3.1.1. Prikaz pro kontrolu CSR
+Validaci CSR souboru provedeme prikazem:
+
+csr check
+
+
+cd ansible/auto_tls/files/csr_${date}
+openssl req -text -noout -verify -in ${edge/master_inventory_hostname}.csr 
+# Napr.
+openssl req -text -noout -verify -in cn64x061.sos.kb.cz.csr
+3.1.2. Master + Edge
+CSR pro master servery (head) a edge server musi obsahovat CN konkretniho serveru + DNS alias loadbalancer pro pripojeni Hive a Imapala (pro CDPD se pouziva cdpd.kb.cz, pro CDPP se pouziva cdpp.kb.cz)
+
+Ve vysledku hledame Nginx domenu + hostname konkretniho serveru, pro ktery certifikat generujeme - je potreba kvuli SSL pripojeni Agent k CM serveru:
+
+
+
+Requested Extensions:
+            X509v3 Subject Alternative Name: 
+                DNS:cdpp.kb.cz, DNS:cv74x012.sos.kb.cz
+ X509v3 Extended Key Usage: 
+                TLS Web Server Authentication, TLS Web Client Authentication
+3.1.3. Worker
+Worker node nema zadne pozadavky, musi obsahovat pouze zaznam sveho hostname, ktery je uveden v CN. V CSR workeru hledame:
+
+
+
+ Subject: C = CZ, O = Komercni banka, OU = DPT CoreTools, CN = ${worker_name}
+ X509v3 Extended Key Usage: 
+                TLS Web Server Authentication, TLS Web Client Authentication
+3.1.4. Nginx
+Nginx server ma specialni pozadavky a v tuto chvili se pouziva * konvence pro DNS aliasy v certifikatu. Na to byla vyjednana vyjimka, v budoucnosti se vsak muze zmenit a bude treba vygenerovat certifikat pro kazdou sluzbu (Hue, CM nebo Jupyterhub) zvlast.
+
+V CSR pro Nginx servery hledame:
+
+
+
+ Subject: C = CZ, O = Komercni banka, OU = DPT CoreTools, CN = ${nginx_server_name}
+ Requested Extensions:
+            X509v3 Subject Alternative Name: 
+                DNS:*.cdpd.kb.cz, DNS:cdpd.kb.cz, DNS:vcnbb0019.sos.kb.cz
+ X509v3 Extended Key Usage: 
+                TLS Web Server Authentication, TLS Web Client Authentication
+
+
+4. Enable AutoTLS
+Pro zapnuti AutoTLS musime provest nasledujici kroky:
+
+Docasne zalozit uzivatele se sudo pravy a heslem
+Pripravit slozky na CM serveru
+Nahrat podepsane certifikaty a klice na CM server
+Spustit CM API call generateCmca
+Restartovat Cloudera Manager
+Restartovat Cloudera Agenty
+Restartovat cluster
+Smazat uzivatele
+Odstranit sudo prava 
+4.1. Zalozeni uzivatele v clusteru
+Pro zalozeni uzivatele spustime playbook:
+
+create local user
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# Prepare encrypted password for ansible playbook
+python -c 'import crypt; print(crypt.crypt("xxx", crypt.mksalt(crypt.METHOD_SHA512)))'
+
+# Vygenerovanou hodnotu hesla pak nahradime v roles/create_user/tasks/main.yaml
+password: "$6$cdWXF/I10HzdtmvAvT/06glLUMTe3GBkaaVzP7qsZhZnPxxxxxasasm0LEqPW/UGGwOWzA32AXSHHMiyf25He."
+
+# Create local user with password
+ansible-playbook playbooks/create_user.yml -i inventory/cdpd -b
+Pro vytvoreni sudo prav uzivateli spustime playbook:
+
+grant sudo to user
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# Copy auto_tls sudoers file to files folder
+cp roles/sudoers/files/etc/sudoers.d/KBAutoTLS roles/sudoers/files/etc/sudoers.d/edge/
+cp roles/sudoers/files/etc/sudoers.d/KBAutoTLS roles/sudoers/files/etc/sudoers.d/worker/
+cp roles/sudoers/files/etc/sudoers.d/KBAutoTLS roles/sudoers/files/etc/sudoers.d/master/
+
+# Create local user with password
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=edge" -u e57p00 --ask-pass
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=worker" -u e57p00 --ask-pass
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=master" -u e57p00 --ask-pass
+4.2. Priprava slozek na CM serveru a nahrani certifikatu s klicema
+Na CM serveru pripravime strukturu slozek, kterou pote budem pouzivat pro ukladani CSR souboru, certifikatu, klicu a secretu.
+
+create AutoTLS folders
+
+
+ssh ${CM_Server}
+
+mkdir -p /opt/cloudera/AutoTLS
+mkdir -p /opt/cloudera/AutoTLS/certs
+mkdir -p /opt/cloudera/AutoTLS/keys
+mkdir -p /opt/cloudera/AutoTLS/csr
+mkdir -p /opt/cloudera/AutoTLS/scripts
+mkdir -p /opt/cloudera/AutoTLS/archive
+mkdir -p /opt/cloudera/AutoTLS/.secret
+
+
+# tree /opt/cloudera/AutoTLS
+.
+├── archive
+├── certs
+├── csr
+└── keys
+
+
+Po zalozeni slozek nahrajeme podepsane certifikaty do slozky certs - nazev certifikatu musi byt ve formatu - ${server_hostname}.crt a klic - ${server_hostname}.key
+
+Dale vygenerujeme heslo k jks souborum do slozky secret:
+
+generate password
+
+
+# Generate truststore password
+head -c 18 /dev/urandom | base64 > /opt/cloudera/AutoTLS/.secret/truststore.pwd
+# Generate keystore password
+head -c 18 /dev/urandom | base64 > /opt/cloudera/AutoTLS/.secret/keystore.pwd
+Tim mame pripravene vse co potrebujeme k zapnuti AutoTLS.
+
+4.3. Zapnuti AutoTLS
+Zapnuti AutoTLS se dela pomoci CM Api callu. Pro zavolani si pripravime nasledujici skript:
+
+Enable AutoTLS
+
+
+curl -i -v -u admin_auto_tls:xxxx -X POST --header 'Content-Type: application/json' --header 'Accept: application/json' -d @tls.json 'http://${CM_Server}:7180/api/v41/cm/commands/generateCmca'
+Kde tls.json soubor vypada nasledovne (pouzity json pro CDPD):
+
+tls.json
+
+
+{
+"location" : "/opt/cloudera/AutoTLS",
+"customCA" : true,
+"interpretAsFilenames" : true,
+"cmHostCert" : "/opt/cloudera/AutoTLS/certs/cn75x007.sos.kb.cz.crt",
+"cmHostKey" : "/opt/cloudera/AutoTLS/keys/cn75x007.sos.kb.cz.key",
+"caCert" : "/appl/common/certs/kbcatech.cer",
+"keystorePasswd" : "/opt/cloudera/AutoTLS/.secret/keystore.pwd",
+"truststorePasswd" : "/opt/cloudera/AutoTLS/.secret/truststore.pwd",
+"hostCerts" : [ {
+"hostname" : "cn75x006.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x006.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x006.sos.kb.cz.key"
+}, {
+"hostname" : "cn75x007.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x007.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x007.sos.kb.cz.key"
+}, {
+"hostname" : "cn64x061.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn64x061.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn64x061.sos.kb.cz.key"
+}, {
+"hostname" : "cn75x001.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x001.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x001.sos.kb.cz.key"
+}, {
+"hostname" : "cn75x002.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x002.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x002.sos.kb.cz.key"
+}, {
+"hostname" : "cn75x003.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x003.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x003.sos.kb.cz.key"
+} , {
+"hostname" : "cn75x004.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x004.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x004.sos.kb.cz.key"
+} , {
+"hostname" : "cn75x005.sos.kb.cz",
+"certificate" : "/opt/cloudera/AutoTLS/certs/cn75x005.sos.kb.cz.crt",
+"key" : "/opt/cloudera/AutoTLS/keys/cn75x005.sos.kb.cz.key"
+}],
+"configureAllServices" : "true",
+"sshPort" : 22,
+"userName" : "auto_tls",
+"password" : "xxx"
+}
+(warning) Json soubor je treba upravit podle vlastni potreby!
+
+4.4. Restart cloudera-scm-server
+restart cloudera-scm-server
+
+
+ssh ${CM_Server}
+
+systemctl restart cloudera-scm-server
+
+
+4.5. Restart cloudera-scm-agent
+restart cloudera-scm-server
+
+
+ssh ${ansible_server}
+cd ansible/auto_tls
+
+ansible -m shell -a "systemctl restart cloudera-scm-agent" -b worker,edge,master -i inventory/cdpd
+4.6. Restart cluster
+
+
+
+
+
+
+4.7. Smazani uzivatele z clusteru a odstraneni sudo prav
+Pro odstraneni uzivatele pustime playbook:
+
+create local user
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# Delete local user
+ansible-playbook playbooks/delete_user.yaml -i inventory/cdpd -b
+Pro odstraneni sudo prav spustime playbook:
+
+delete sudoers
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# Remove auto_tls sudoers from sudoers files
+rm roles/sudoers/files/etc/sudoers.d/edge/KBAutoTLS
+rm roles/sudoers/files/etc/sudoers.d/master/KBAutoTLS
+rm roles/sudoers/files/etc/sudoers.d/worker/KBAutoTLS
+
+# Delete sudoers file for auto_tls user
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=edge" -u e57p00 --ask-pass -t cleanup
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=worker" -u e57p00 --ask-pass -t cleanup
+ansible-playbook sudoers.yaml -i inventory/cdpd -b -e "server=master" -u e57p00 --ask-pass -t cleanup
+
+
+5. Validace
+5.1. Kontrola cloudera-scm-agent konfigurace
+Pro spravne fungovani musi dojit k automaticke zmene /etc/cloudera-scm-agent/config.ini
+
+Zde hledame hodnoty:
+
+agent config.ini
+
+
+use_tls = 1
+### FOLLOWING SECTION AUTO-GENERATED BY AUTO-TLS ###
+### DO NOT MODIFY ###
+[Security]
+verify_cert_file=/var/lib/cloudera-scm-agent/agent-cert/cm-auto-in_cluster_ca_cert.pem
+client_cert_file=/var/lib/cloudera-scm-agent/agent-cert/cm-auto-host_cert_chain.pem
+client_key_file=/var/lib/cloudera-scm-agent/agent-cert/cm-auto-host_key.pem
+client_keypw_file=/var/lib/cloudera-scm-agent/agent-cert/cm-auto-host_key.pw
+cm_auto_cert_dir=/var/lib/cloudera-scm-agent/agent-cert
+### PRECEDING SECTION AUTO-GENERATED BY AUTO-TLS ###
+5.2. Troubleshooting
+V pripade problemu se zapnutim AutoTLS funkcionality, zkontrolujeme nasledujici logy na CM serveru:
+
+cloudera-scm-server logy - /var/log/cloudera-scm-server/cloudera-scm-server.log
+certmanager logy - /var/log/cloudera-scm-agent/certmanager.log
+a certifikaty ve slozce /opt/cloudera
+
+delete sudoers
+
+
+# Check certificate for correct DNS alias
+openssl x509 -in certificate.crt -text -noout
+
+# Check if certificate matches key
+openssl pkey -in /opt/cloudera/AutoTLS/keys/${hostname}.key -pubout -outform pem | sha256sum
+openssl x509 -in /opt/cloudera/AutoTLS/certs/${hostname}.crt -pubkey -noout -outform pem | sha256sum
+
+#or
+openssl x509 -noout -modulus -in your_certificate.crt | openssl md5
+openssl rsa -noout -modulus -in your_private_key.key | openssl md5
+
+
+6. Nahrazeni certifikatu
+Pote co obdrzime podepsany certifikat, je treba ho nahrat na Cloudera Manager server do slozky /opt/cloudera/AutoTLS/certs. Dale take musime nahrat jeho privatni klic do slozky /opt/cloudera/AutoTLS/keys.
+
+Certifikat se musi jmenovat ${hostname}.crt
+
+Klic se musi jmenovat ${hostname}.key
+
+Pote, co budeme mit toto pripravene, muzeme spustit ansible skript pro vytvoreni potrebnych keystoru a pem souboru a nasledne je rozdistribuovat na servery, kde certifikaty nahrajeme.
+
+
+
+# Clone ansible repo
+git clone https://git.kb.cz/scm/cotool/ansible.git
+cd ansible/auto_tls
+
+# Edit vars file and write password in cm_admin_password and optionaly switch cm_admin_user to your personal user
+vi roles/replace_certificates/vars/main.yaml
+
+# Replace certificates in cluster
+ansible-playbook playbooks/replace_certificates.yaml -i inventory/cdpd -b -u $(logname) --ask-pass
+
+# Replace certificates on worker nodes only
+ansible-playbook playbooks/replace_certificates.yaml -i inventory/cdpd -b -u $(logname) --ask-pass -l worker
+
+
+
+
+
+7. Adhoc prikazy
+
+
+# Check CSR
+openssl req -text -noout -verify -in CSR.csr
+
+# Check certificate 
+openssl x509 -in certificate.crt -text -noout
+
+# Check key
+openssl rsa -in privateKey.key -check
+
+# Check p12 
+openssl pkcs12 -info -in keyStore.p12
+
+# Convert JKS to Pem
+## convert to p12 first
+keytool -importkeystore -srckeystore cm-auto-global_truststore.jks -destkeystore keystore.p12 -srcstoretype jks -deststoretype pkcs12
+## Convert p12 to pem
+openssl pkcs12 -in keystore.p12 -out keystore.pem
